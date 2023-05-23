@@ -22,6 +22,7 @@ import (
 	"errors"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -29,6 +30,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto/bls12381"
 	"github.com/ethereum/go-ethereum/crypto/bn256"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"golang.org/x/crypto/ripemd160"
 )
 
@@ -88,6 +91,8 @@ var PrecompiledContractsBerlin = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{7}): &bn256ScalarMulIstanbul{},
 	common.BytesToAddress([]byte{8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{9}): &blake2F{},
+
+  common.BytesToAddress([]byte{0x92}): &mptVerify{},
 }
 
 // PrecompiledContractsBLS contains the set of pre-compiled Ethereum
@@ -153,6 +158,71 @@ func RunPrecompiledContract(p PrecompiledContract, input []byte, suppliedGas uin
 	suppliedGas -= gasCost
 	output, err := p.Run(input)
 	return output, suppliedGas, err
+}
+
+type mptVerify struct{}
+
+func (c *mptVerify) RequiredGas(input []byte) uint64 {
+  return params.MptVerifyGas
+}
+
+type mappingKeyValue map[string][]byte
+
+func (kv mappingKeyValue) Has(key []byte) (bool, error) {
+  _, has := kv[string(key)]
+  return has, nil
+}
+
+func (kv mappingKeyValue) Get(key []byte) ([]byte, error) {
+  v := kv[string(key)]
+  return v, nil
+}
+
+var (
+  errMptVerifyInvalidInput = errors.New("invalid mpt verify input")
+)
+
+func (c *mptVerify) Run(input []byte) ([]byte, error) {
+  // [root <32 bytes>, key <32 bytes>, proof <32 bytes length><n bytes arrays prefixed with length>]
+
+  if len(input) < 96 {
+    return nil, errMptVerifyInvalidInput
+  }
+
+  uint256Ty, _ := abi.NewType("uint256", "", nil)
+  bytesArrTy, _ := abi.NewType("bytes[]", "", nil)
+
+  arguments := abi.Arguments{
+    abi.Argument{ Name: "root", Type: uint256Ty },
+    abi.Argument{ Name: "key", Type: uint256Ty },
+    abi.Argument{ Name: "proof", Type: bytesArrTy },
+  }
+
+  r, err := arguments.Unpack(input)
+  if err != nil {
+    return nil, errMptVerifyInvalidInput
+  }
+
+  root, _ := r[0].(*big.Int)
+  key, _ := r[1].(*big.Int)
+  proof, _ := r[2].([][]byte)
+
+  proofKv := mappingKeyValue{}
+  for _, step := range proof {
+    hash := crypto.Keccak256(step)
+    proofKv[string(hash)] = step
+  }
+
+  v, err := trie.VerifyProof(common.BigToHash(root), key.Bytes(), proofKv)
+  if err != nil {
+    return nil, errMptVerifyInvalidInput
+  }
+
+  var rlpDecoded []byte
+  if err = rlp.DecodeBytes(v, &rlpDecoded); err != nil {
+    return nil, err
+  }
+  return rlpDecoded, nil
 }
 
 // ECRECOVER implemented as a native contract.
